@@ -1,350 +1,402 @@
 """
-Omada Controller Integration Module
-Fetches/generates voucher codes from TP-Link Omada Controller API
-and stores them in the database.
+Omada Cloud Integration Module
+Authenticates via Playwright (headless browser) to handle TP-Link's OAuth flow,
+then uses httpx with the session cookies + csrf-token header for API access.
 
-Omada API Reference:
-- Login: POST /{controllerId}/api/v2/sites/{siteId}/login
-- Create Vouchers: POST /{controllerId}/api/v2/sites/{siteId}/cmd/hotspot
-- List Vouchers: POST /{controllerId}/api/v2/sites/{siteId}/cmd/hotspot (action=list)
+Key findings:
+- Omada Cloud uses OAuth via id.tplinkcloud.com
+- API calls require a `csrf-token` header (lowercase, hyphenated)
+- Controller API is accessed via the connector at:
+  https://{region}-api-omada-controller-connector.tplinkcloud.com/omadac/{deviceId}/{omadacId}/api/v2/...
+- Hotspot/voucher endpoints may require specific site context
 """
-import httpx
+import asyncio
 import logging
-import json
-from typing import Optional
+import httpx
+import warnings
+from typing import Optional, Tuple
 from config import (
     OMADA_CONTROLLER_URL, OMADA_USERNAME, OMADA_PASSWORD, OMADA_SITE_ID
 )
 from database import add_codes_bulk
 
+warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
-# Duration mapping: type -> minutes
 DURATION_MAP = {
-    "daily": 1440,       # 24 hours
-    "3days": 4320,       # 72 hours
-    "weekly": 10080,     # 7 days
-    "monthly": 43200     # 30 days
+    "daily": 1440,
+    "3days": 4320,
+    "weekly": 10080,
+    "monthly": 43200
 }
 
 
-class OmadaController:
-    """Client for TP-Link Omada Controller API."""
+class OmadaCloudSession:
+    """
+    Manages an authenticated session to the Omada Cloud.
+    Uses Playwright for the OAuth login flow, then httpx for API calls.
+    """
 
     def __init__(self):
-        self.base_url = OMADA_CONTROLLER_URL
-        self.username = OMADA_USERNAME
+        self.email = OMADA_USERNAME
         self.password = OMADA_PASSWORD
-        self.site_id = OMADA_SITE_ID
-        self.token = None
         self.csrf_token = None
-        self.controller_id = None
-        self.client = None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
-        if self.client is None or self.client.is_closed:
-            self.client = httpx.AsyncClient(
-                verify=False,  # Omada often uses self-signed certs
-                timeout=30.0
-            )
-        return self.client
+        self.session_cookie = None
+        self.cookies = {}
+        self.http_client = None
+        self.device_id = None
+        self.omadac_id = None
+        self.site_id = None
+        self.connector_base = None
+        self.manager_base = None
+        self.access_base = None
 
     async def login(self) -> bool:
-        """Authenticate with the Omada Controller."""
-        client = await self._get_client()
+        """Login to Omada Cloud using Playwright browser automation."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.error("Playwright not installed. Run: pip install playwright && python -m playwright install chromium")
+            return False
 
         try:
-            # First, try to get the controller ID
-            resp = await client.get(f"{self.base_url}/api/v2/sites")
-            if resp.status_code == 200:
-                data = resp.json()
-                if "result" in data and data["result"]:
-                    self.controller_id = None  # No controller ID prefix for newer versions
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    ignore_https_errors=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                page = await context.new_page()
 
-            # Try login with v2 API
-            login_url = f"{self.base_url}/api/v2/sites/{self.site_id}/login"
-            login_data = {
-                "userName": self.username,
-                "password": self.password
-            }
+                # Capture API responses to get controller info
+                api_data = {}
 
-            resp = await client.post(login_url, json=login_data)
+                async def on_response(response):
+                    url = response.url
+                    if response.status == 200 and 'api-omada' in url:
+                        try:
+                            body = await response.json()
+                            if body.get('errorCode') == 0:
+                                if 'login-with-uid-code' in url:
+                                    self.csrf_token = body['result']['csrfToken']
+                                elif 'organizations' in url and 'cloud-device-info' not in url:
+                                    result = body.get('result', {})
+                                    if isinstance(result, dict) and result.get('data'):
+                                        for org in result['data']:
+                                            self.device_id = org.get('deviceId')
+                                            break
+                                elif 'cloud-device-info' in url:
+                                    pass  # Device info captured
+                        except:
+                            pass
 
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("errorCode") == 0:
-                    # Extract token from response
-                    result = data.get("result", {})
-                    self.token = result.get("token")
-                    self.csrf_token = resp.headers.get("Csrf-Token", "")
+                page.on('response', on_response)
 
-                    # Set cookies/headers for future requests
-                    if self.token:
-                        self.client.cookies.set("TOKEN", self.token)
+                # Navigate to Omada Cloud
+                portal_url = OMADA_CONTROLLER_URL.rstrip('/')
+                if not portal_url:
+                    portal_url = "https://euw1-omada-cloud.tplinkcloud.com"
 
-                    logger.info("Successfully logged into Omada Controller")
-                    return True
+                logger.info(f"Navigating to {portal_url}...")
+                await page.goto(portal_url, wait_until="networkidle", timeout=30000)
+
+                # Fill login form
+                await page.wait_for_selector('#form_item_email', timeout=15000)
+                await page.fill('#form_item_email', self.email)
+                await page.fill('#form_item_password', self.password)
+
+                # Click Sign In
+                sign_in = page.locator('a.s-button-primary')
+                await sign_in.click()
+
+                # Wait for redirect back to portal
+                await page.wait_for_url("**/*omada*cloud*/**", timeout=45000)
+                await page.wait_for_timeout(10000)
+
+                # Get cookies
+                cookies = await context.cookies()
+                for c in cookies:
+                    self.cookies[c['name']] = c['value']
+                    if c['name'] == 'SESSION':
+                        self.session_cookie = c['value']
+                    if c['name'] == 'csrfToken' and not self.csrf_token:
+                        self.csrf_token = c['value']
+
+                # Extract region info from URL
+                current_url = page.url
+                if 'euw1' in current_url:
+                    region = 'euw1'
+                elif 'aps1' in current_url:
+                    region = 'aps1'
+                elif 'use1' in current_url:
+                    region = 'use1'
                 else:
-                    logger.error(f"Omada login failed: {data}")
-            else:
-                logger.error(f"Omada login HTTP error: {resp.status_code}")
+                    region = 'euw1'
 
-            # Try alternate login endpoint (older firmware)
-            alt_login_url = f"{self.base_url}/login"
-            resp = await client.post(alt_login_url, data={
-                "userName": self.username,
-                "password": self.password
-            })
+                # Set API base URLs
+                self.manager_base = f"https://{region}-api-omada-cloud-manager.tplinkcloud.com"
+                self.access_base = f"https://{region}-api-omada-cloud-access.tplinkcloud.com"
+                self.connector_base = f"https://{region}-api-omada-controller-connector.tplinkcloud.com"
 
-            if resp.status_code == 200:
-                self.csrf_token = resp.headers.get("Csrf-Token", "")
-                logger.info("Logged in via alternate endpoint")
-                return True
+                # Try to get omadacId by clicking on the controller
+                if self.device_id:
+                    try:
+                        ctrl_el = await page.query_selector('text=Omada Controller')
+                        if ctrl_el:
+                            await ctrl_el.dblclick()
+                            await page.wait_for_timeout(5000)
+
+                            # Get the controller page's API calls to extract omadacId
+                            for pg in context.pages:
+                                if 'omadacId' in pg.url:
+                                    import re
+                                    match = re.search(r'omadacId=([a-f0-9]+)', pg.url)
+                                    if match:
+                                        self.omadac_id = match.group(1)
+                                    break
+                    except Exception as e:
+                        logger.warning(f"Could not get omadacId: {e}")
+
+                await browser.close()
+
+            # Set up httpx client with cookies
+            self.http_client = httpx.Client(verify=False, timeout=30.0)
+            for name, value in self.cookies.items():
+                self.http_client.cookies.set(name, value, domain='.tplinkcloud.com', path='/')
+
+            # If we don't have omadacId yet, try to get it via API
+            if not self.omadac_id and self.device_id:
+                await self._get_omadac_id()
+
+            logger.info(f"✅ Omada Cloud login successful!")
+            logger.info(f"   CSRF Token: {self.csrf_token}")
+            logger.info(f"   Device ID: {self.device_id}")
+            logger.info(f"   Omadac ID: {self.omadac_id}")
+            return True
 
         except Exception as e:
-            logger.error(f"Omada login error: {e}")
+            logger.error(f"Omada Cloud login failed: {e}")
+            return False
 
-        return False
+    async def _get_omadac_id(self):
+        """Get the omadacId for the controller via API."""
+        if not self.device_id or not self.http_client:
+            return
 
-    async def _api_request(self, method: str, endpoint: str, data: dict = None) -> Optional[dict]:
-        """Make an authenticated API request to Omada."""
-        client = await self._get_client()
+        try:
+            r = self.http_client.get(
+                f"{self.access_base}/api/v2/cloudaccess/organizations/{self.device_id}",
+                headers=self._headers()
+            )
+            body = r.json()
+            if body.get('errorCode') == 0:
+                # The omadacId might be in the response
+                pass
 
-        url = f"{self.base_url}/api/v2/sites/{self.site_id}/{endpoint}"
-        headers = {}
+            # Try via v2 API
+            r2 = self.http_client.post(
+                f"{self.access_base}/api/v2/cloudaccess/organizations/{self.device_id}",
+                json={},
+                headers=self._headers()
+            )
+            body2 = r2.json()
+            if body2.get('errorCode') == 0:
+                self.omadac_id = body2.get('result', {}).get('omadacId')
+        except Exception as e:
+            logger.warning(f"Could not get omadacId via API: {e}")
 
-        if self.csrf_token:
-            headers["Csrf-Token"] = self.csrf_token
+    def _headers(self) -> dict:
+        """Get the standard API headers including csrf-token."""
+        return {
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'csrf-token': self.csrf_token or '',
+            'Referer': f'{OMADA_CONTROLLER_URL.rstrip("/")}/' if OMADA_CONTROLLER_URL else 'https://euw1-omada-cloud.tplinkcloud.com/',
+            'Origin': OMADA_CONTROLLER_URL.rstrip('/') if OMADA_CONTROLLER_URL else 'https://euw1-omada-cloud.tplinkcloud.com',
+        }
 
-        if method == "POST":
-            resp = await client.post(url, json=data, headers=headers)
-        else:
-            resp = await client.get(url, headers=headers)
+    def _connector_url(self, path: str) -> str:
+        """Build a connector API URL."""
+        if not self.device_id or not self.omadac_id:
+            raise ValueError("device_id and omadac_id required for connector API")
+        return f"{self.connector_base}/omadac/{self.device_id}/{self.omadac_id}{path}"
 
-        if resp.status_code == 200:
-            return resp.json()
+    async def get_sites(self) -> list:
+        """Get list of sites from the controller."""
+        if not self.http_client:
+            return []
 
-        logger.error(f"Omada API error: {resp.status_code} - {resp.text}")
-        return None
+        try:
+            r = self.http_client.get(
+                self._connector_url("/api/v2/sites/basic?currentPageSize=50&currentPage=1"),
+                headers=self._headers()
+            )
+            body = r.json()
+            if body.get('errorCode') == 0:
+                sites = body.get('result', {}).get('data', [])
+                if sites and not self.site_id:
+                    self.site_id = sites[0].get('id')
+                return sites
+        except Exception as e:
+            logger.error(f"Error getting sites: {e}")
+        return []
+
+    async def get_vouchers(self) -> list:
+        """Get hotspot voucher codes from the controller."""
+        if not self.http_client:
+            return []
+
+        try:
+            # Try multiple voucher endpoint patterns
+            endpoints = [
+                self._connector_url(f"/api/v2/sites/{self.site_id}/hotspot/vouchers"),
+                self._connector_url(f"/api/v2/hotspot/vouchers?currentPageSize=100&currentPage=1"),
+                self._connector_url(f"/{self.site_id}/api/v2/cmd/hotspot"),
+            ]
+
+            for url in endpoints:
+                try:
+                    if 'cmd/hotspot' in url:
+                        r = self.http_client.post(url,
+                            json={"cmd": "listVouchers", "params": {"currentPage": 1, "currentPageSize": 100}},
+                            headers=self._headers())
+                    else:
+                        r = self.http_client.get(url, headers=self._headers())
+
+                    body = r.json()
+                    if body.get('errorCode') == 0:
+                        result = body.get('result', {})
+                        vouchers = result.get('data', []) if isinstance(result, dict) else result
+                        return vouchers
+                except:
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error getting vouchers: {e}")
+        return []
 
     async def create_vouchers(self, duration_type: str, count: int = 10) -> list:
-        """
-        Create new voucher codes on the Omada Controller.
-        
-        Args:
-            duration_type: 'daily', '3days', 'weekly', or 'monthly'
-            count: Number of vouchers to create
-        
-        Returns:
-            List of voucher code strings
-        """
+        """Create new voucher codes on the controller."""
+        if not self.http_client:
+            return []
+
         duration_minutes = DURATION_MAP.get(duration_type)
         if not duration_minutes:
-            logger.error(f"Invalid duration type: {duration_type}")
             return []
 
-        # Create vouchers via Omada API
-        data = {
-            "cmd": "createVouchers",
-            "action": "createVouchers",
-            "params": {
-                "count": count,
-                "minutes": duration_minutes,
-                "name": f"bot_{duration_type}",
-                "uploadKbps": -1,    # Unlimited
-                "downloadKbps": -1,  # Unlimited
-                "byteQuota": -1,     # Unlimited
-                "type": 1            # Type 1 = time-based
+        try:
+            # Create vouchers via the controller API
+            create_url = self._connector_url(f"/{self.site_id}/api/v2/cmd/hotspot")
+            payload = {
+                "cmd": "createVouchers",
+                "params": {
+                    "count": count,
+                    "minutes": duration_minutes,
+                    "name": f"bot_{duration_type}",
+                    "uploadKbps": -1,
+                    "downloadKbps": -1,
+                    "byteQuota": -1,
+                    "type": 1
+                }
             }
-        }
 
-        result = await self._api_request("POST", "cmd/hotspot", data)
+            r = self.http_client.post(create_url, json=payload, headers=self._headers())
+            body = r.json()
 
-        if not result or result.get("errorCode") != 0:
-            logger.error(f"Failed to create vouchers: {result}")
-            return []
+            if body.get('errorCode') == 0:
+                # Fetch the newly created vouchers
+                await asyncio.sleep(2)  # Brief delay for creation
+                return await self.get_vouchers()
 
-        # After creation, fetch the vouchers to get the actual codes
-        vouchers = await self._fetch_recent_vouchers(count)
-        return vouchers
+        except Exception as e:
+            logger.error(f"Error creating vouchers: {e}")
+        return []
 
-    async def _fetch_recent_vouchers(self, count: int = 10) -> list:
-        """Fetch the most recently created vouchers."""
-        data = {
-            "cmd": "listVouchers",
-            "action": "listVouchers",
-            "params": {
-                "currentPage": 1,
-                "currentPageSize": count,
-                "orderBy": "createTime",
-                "sortOrder": "DESC"
-            }
-        }
-
-        result = await self._api_request("POST", "cmd/hotspot", data)
-
-        if not result or result.get("errorCode") != 0:
-            logger.error(f"Failed to list vouchers: {result}")
-            return []
-
-        vouchers = []
-        voucher_list = result.get("result", {}).get("data", [])
-
-        for v in voucher_list:
-            code = v.get("code", "")
-            if code:
-                vouchers.append({
-                    "code": code,
-                    "id": v.get("id", ""),
-                    "duration": v.get("minutes", 0)
-                })
-
-        return vouchers
-
-    async def list_all_unused_vouchers(self) -> list:
-        """List all unused vouchers from the Omada controller."""
-        data = {
-            "cmd": "listVouchers",
-            "action": "listVouchers",
-            "params": {
-                "currentPage": 1,
-                "currentPageSize": 200,
-                "status": 0  # 0 = unused
-            }
-        }
-
-        result = await self._api_request("POST", "cmd/hotspot", data)
-
-        if not result or result.get("errorCode") != 0:
-            logger.error(f"Failed to list unused vouchers: {result}")
-            return []
-
-        vouchers = []
-        voucher_list = result.get("result", {}).get("data", [])
-
-        for v in voucher_list:
-            code = v.get("code", "")
-            if code:
-                vouchers.append({
-                    "code": code,
-                    "id": v.get("id", ""),
-                    "duration": v.get("minutes", 0),
-                    "status": v.get("status", -1)
-                })
-
-        return vouchers
-
-    async def close(self):
+    def close(self):
         """Close the HTTP client."""
-        if self.client and not self.client.is_closed:
-            await self.client.aclose()
+        if self.http_client:
+            self.http_client.close()
 
 
-async def sync_codes_from_omada(duration_type: str = None, count: int = 20):
+async def sync_codes_from_omada(duration_type: str = None, count: int = 20) -> Tuple[bool, str]:
     """
-    Sync codes from Omada Controller into the local database.
-    Can be called to create new codes or import existing unused ones.
-    
-    Args:
-        duration_type: If specified, create new codes of this type.
-                       If None, import all existing unused vouchers.
-        count: Number of new codes to create (if duration_type specified)
+    Sync codes from Omada Cloud Controller into the local database.
     """
-    controller = OmadaController()
+    session = OmadaCloudSession()
 
     try:
-        logged_in = await controller.login()
+        logged_in = await session.login()
         if not logged_in:
-            logger.error("Could not login to Omada Controller")
-            return False, "Failed to connect to Omada Controller"
+            return False, "Failed to login to Omada Cloud. Check credentials in .env"
+
+        # Get sites first
+        sites = await session.get_sites()
+        if not sites:
+            return False, "No sites found on the controller"
 
         if duration_type:
-            # Create new vouchers of specified type
-            vouchers = await controller.create_vouchers(duration_type, count)
+            # Create new vouchers
+            vouchers = await session.create_vouchers(duration_type, count)
         else:
-            # Import all existing unused vouchers
-            vouchers = await controller.list_all_unused_vouchers()
+            # Get existing vouchers
+            vouchers = await session.get_vouchers()
 
         if not vouchers:
             return False, "No vouchers retrieved from Omada"
 
-        # Map durations back to types
+        # Map durations to types
         reverse_duration = {v: k for k, v in DURATION_MAP.items()}
 
-        # Prepare bulk insert data
         codes_data = []
         for v in vouchers:
-            dur_type = reverse_duration.get(v["duration"], "unknown")
-            if dur_type == "unknown":
-                # Try to find closest match
+            code = v.get('code', v.get('voucherCode', ''))
+            duration = v.get('duration', v.get('minutes', 0))
+            dur_type = reverse_duration.get(duration, 'unknown')
+
+            if dur_type == 'unknown':
                 for key, minutes in DURATION_MAP.items():
-                    if abs(v["duration"] - minutes) < 60:
+                    if abs(duration - minutes) < 60:
                         dur_type = key
                         break
 
-            codes_data.append((
-                v["code"],
-                dur_type,
-                v["duration"],
-                v.get("id", "")
-            ))
+            if code:
+                codes_data.append((code, dur_type, duration, v.get('id', '')))
 
-        await add_codes_bulk(codes_data)
-        await controller.close()
+        if codes_data:
+            await add_codes_bulk(codes_data)
 
+        session.close()
         return True, f"Successfully synced {len(codes_data)} codes"
 
     except Exception as e:
-        logger.error(f"Error syncing codes from Omada: {e}")
+        logger.error(f"Error syncing codes: {e}")
         return False, f"Error: {str(e)}"
     finally:
-        await controller.close()
+        session.close()
 
 
-async def import_codes_from_file(filepath: str) -> tuple:
-    """
-    Import codes from a CSV or text file as an alternative to Omada API.
-    
-    File format (CSV):
-        code,duration_type
-        
-    File format (TXT - one per line):
-        CODE123|daily
-        CODE456|weekly
-    
-    Returns: (success: bool, message: str)
-    """
+async def import_codes_from_file(filepath: str) -> Tuple[bool, str]:
+    """Import codes from a CSV/text file."""
     try:
         codes_data = []
-
         with open(filepath, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
-
-                # Try CSV format
-                if ',' in line:
-                    parts = line.split(',')
-                elif '|' in line:
-                    parts = line.split('|')
-                else:
-                    continue
-
+                sep = ',' if ',' in line else '|'
+                parts = line.split(sep)
                 if len(parts) >= 2:
                     code = parts[0].strip()
                     dur_type = parts[1].strip().lower()
                     minutes = DURATION_MAP.get(dur_type, 0)
-
                     if code and dur_type in DURATION_MAP:
                         codes_data.append((code, dur_type, minutes, ""))
 
         if codes_data:
             await add_codes_bulk(codes_data)
             return True, f"Imported {len(codes_data)} codes from file"
-        else:
-            return False, "No valid codes found in file"
-
+        return False, "No valid codes found in file"
     except Exception as e:
         return False, f"Error importing file: {str(e)}"
