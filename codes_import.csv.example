@@ -1,0 +1,9 @@
+# Sample codes import file
+# Format: code,duration_type
+# Valid duration types: daily, 3days, weekly, monthly
+#
+# Example entries (replace with your actual Omada codes):
+# ABC12345,daily
+# DEF67890,3days
+# GHI13579,weekly
+# JKL24680,monthly
