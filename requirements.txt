@@ -1,7 +1,9 @@
+# Core bot dependencies (lightweight - no browser needed)
 python-telegram-bot==20.7
-requests==2.31.0
 python-dotenv==1.0.0
 aiosqlite==0.19.0
 httpx==0.25.2
-apscheduler==3.10.4
+requests==2.31.0
+
+# For code extraction from Omada Cloud (needs browser)
 playwright==1.61.0
