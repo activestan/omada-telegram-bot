@@ -524,47 +524,165 @@ async def _process_pasted_codes(update: Update):
 
 
 async def _import_codes_from_text(raw_text: str, message):
-    """Parse and import codes from text."""
+    """Parse and import codes from text. Supports multiple formats:
+    - Simple: CODE,daily
+    - Omada CSV export: with headers like Code,Duration,Name
+    - Tab/comma/pipe separated
+    """
     import aiosqlite
+    import csv
+    import io
     from config import DATABASE_PATH
 
-    lines = raw_text.strip().split('\n')
     valid_durations = {"daily": 1440, "3days": 4320, "weekly": 10080, "monthly": 43200}
+    
+    # Duration mapping: minutes to our type
+    minutes_to_type = {1440: "daily", 4320: "3days", 10080: "weekly", 43200: "monthly"}
+    # Also accept close matches
+    for mins, dtype in list(minutes_to_type.items()):
+        for offset in range(-60, 61):
+            minutes_to_type[mins + offset] = dtype
+
+    # Voucher name to duration type mapping
+    name_to_type = {
+        "whatsapp_1day": "daily", "1day": "daily", "daily": "daily", "1 day": "daily", "24": "daily",
+        "whatsapp_3days": "3days", "3days": "3days", "3 day": "3days", "72": "3days",
+        "whatsapp_7days": "weekly", "7days": "weekly", "weekly": "weekly", "7 day": "weekly", "168": "weekly",
+        "whatsapp_31days": "monthly", "31days": "monthly", "monthly": "monthly", "30 day": "monthly", "31 day": "monthly", "744": "monthly", "720": "monthly",
+    }
 
     codes_to_add = []
     errors = []
+    lines = raw_text.strip().split('\n')
 
-    for i, line in enumerate(lines, 1):
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
+    # Try to detect if this is a CSV with headers (Omada export format)
+    first_line = lines[0].strip().lower() if lines else ""
+    is_csv_with_headers = any(h in first_line for h in ["code", "voucher", "password", "pin", "name", "duration"])
 
-        if ',' in line:
-            parts = line.split(',')
-        elif '|' in line:
-            parts = line.split('|')
-        elif '\t' in line:
-            parts = line.split('\t')
-        else:
-            errors.append(f"Line {i}: No separator — `{line[:30]}`")
-            continue
+    if is_csv_with_headers:
+        # Parse as CSV with headers
+        reader = csv.DictReader(io.StringIO(raw_text))
+        for i, row in enumerate(reader, 2):
+            # Try to find the code field
+            code = ""
+            for key in ["code", "voucher", "password", "pin", "vouchercode", "voucher_code", "Code", "Password"]:
+                if key in row and row[key].strip():
+                    code = row[key].strip()
+                    break
 
-        if len(parts) < 2:
-            errors.append(f"Line {i}: Need code,type — `{line[:30]}`")
-            continue
+            if not code:
+                # Try first non-empty field
+                for val in row.values():
+                    if val and val.strip() and len(val.strip()) > 3:
+                        code = val.strip()
+                        break
 
-        code = parts[0].strip()
-        dur_type = parts[1].strip().lower()
+            if not code:
+                continue
 
-        if not code:
-            errors.append(f"Line {i}: Empty code")
-            continue
-        if dur_type not in valid_durations:
-            errors.append(f"Line {i}: Bad type `{dur_type}`")
-            continue
+            # Try to find duration from name or duration field
+            dur_type = None
+            
+            # Check name field
+            for key in ["name", "portal", "portalname", "Name", "Portal Name"]:
+                if key in row and row[key]:
+                    name_val = row[key].strip().lower()
+                    for pattern, dtype in name_to_type.items():
+                        if pattern in name_val:
+                            dur_type = dtype
+                            break
+                if dur_type:
+                    break
 
-        codes_to_add.append((code, dur_type, valid_durations[dur_type], ""))
+            # Check duration field (in minutes)
+            if not dur_type:
+                for key in ["duration", "minutes", "Duration", "time", "validity"]:
+                    if key in row and row[key]:
+                        try:
+                            mins = int(row[key].strip())
+                            dur_type = minutes_to_type.get(mins)
+                        except ValueError:
+                            # Try to parse "24 hours", "3 days", etc.
+                            val = row[key].strip().lower()
+                            for pattern, dtype in name_to_type.items():
+                                if pattern in val:
+                                    dur_type = dtype
+                                    break
+                    if dur_type:
+                        break
 
+            # If still no type, check if we can infer from any field
+            if not dur_type:
+                for val in row.values():
+                    if val:
+                        val_lower = str(val).strip().lower()
+                        for pattern, dtype in name_to_type.items():
+                            if pattern in val_lower:
+                                dur_type = dtype
+                                break
+                    if dur_type:
+                        break
+
+            if not dur_type:
+                errors.append(f"Row {i}: Can't detect duration for `{code[:20]}` — add ,daily/3days/weekly/monthly")
+                continue
+
+            dur_minutes = valid_durations[dur_type]
+            codes_to_add.append((code, dur_type, dur_minutes, row.get("id", row.get("Id", row.get("ID", "")))))
+
+    else:
+        # Simple format: CODE,duration or CODE|duration
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            if ',' in line:
+                parts = line.split(',')
+            elif '|' in line:
+                parts = line.split('|')
+            elif '\t' in line:
+                parts = line.split('\t')
+            else:
+                errors.append(f"Line {i}: No separator — `{line[:30]}`")
+                continue
+
+            if len(parts) < 2:
+                errors.append(f"Line {i}: Need code,type — `{line[:30]}`")
+                continue
+
+            code = parts[0].strip()
+            dur_input = parts[1].strip().lower()
+
+            if not code:
+                errors.append(f"Line {i}: Empty code")
+                continue
+
+            # Check if it's a direct type or a name pattern
+            dur_type = valid_durations.get(dur_input) and dur_input
+            if not dur_type:
+                dur_type = name_to_type.get(dur_input)
+            if not dur_type:
+                # Try partial match
+                for pattern, dtype in name_to_type.items():
+                    if pattern in dur_input:
+                        dur_type = dtype
+                        break
+            if not dur_type:
+                # Try as minutes
+                try:
+                    mins = int(dur_input)
+                    dur_type = minutes_to_type.get(mins)
+                except ValueError:
+                    pass
+
+            if not dur_type:
+                errors.append(f"Line {i}: Bad type `{dur_input}` — use daily/3days/weekly/monthly")
+                continue
+
+            codes_to_add.append((code, dur_type, valid_durations[dur_type], ""))
+
+    # Insert into database
     inserted = 0
     if codes_to_add:
         async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -572,7 +690,7 @@ async def _import_codes_from_text(raw_text: str, message):
                 try:
                     cursor = await db.execute(
                         "INSERT OR IGNORE INTO codes (code, duration_type, duration_minutes, omada_voucher_id) VALUES (?, ?, ?, ?)",
-                        (code, dur_type, dur_min, vid)
+                        (code, dur_type, dur_min, vid or "")
                     )
                     if cursor.rowcount > 0:
                         inserted += 1
@@ -580,8 +698,9 @@ async def _import_codes_from_text(raw_text: str, message):
                     pass
             await db.commit()
 
+    # Build result
     result = f"📥 *Import Results*\n\n"
-    result += f"📝 Lines read: {len(lines)}\n"
+    result += f"📝 Codes found: {len(codes_to_add)}\n"
     result += f"✅ New codes added: {inserted}\n"
     result += f"♻️ Duplicates skipped: {len(codes_to_add) - inserted}\n"
     if errors:
@@ -601,7 +720,7 @@ async def _import_codes_from_text(raw_text: str, message):
         result += f"\n*Breakdown:*\n"
         for dt, count in sorted(by_type.items()):
             display = DURATION_DISPLAY.get(dt, dt)
-            result += f"  {display}: {count}\n"
+            result += f"  {display}: {count} (added: {min(count, inserted)})\n"
 
     result += f"\n_Send more codes or type `done` to finish._"
     await message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
@@ -634,25 +753,6 @@ def main():
     if not config.TELEGRAM_BOT_TOKEN:
         print("❌ TELEGRAM_BOT_TOKEN not set!")
         return
-
-    # Health check server for Render (Docker web service)
-    import threading, os
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-        def log_message(self, *a): pass
-
-    port = int(os.environ.get("PORT", 10000))
-    try:
-        srv = HTTPServer(("0.0.0.0", port), HealthHandler)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        print(f"🏥 Health check on port {port}")
-    except Exception as e:
-        print(f"⚠️ Health check: {e}")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
