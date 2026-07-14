@@ -635,6 +635,25 @@ def main():
         print("❌ TELEGRAM_BOT_TOKEN not set!")
         return
 
+    # Health check server for Render (Docker web service)
+    import threading, os
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *a): pass
+
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        srv = HTTPServer(("0.0.0.0", port), HealthHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"🏥 Health check on port {port}")
+    except Exception as e:
+        print(f"⚠️ Health check: {e}")
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
