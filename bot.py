@@ -304,6 +304,22 @@ async def _preview_outreach(query):
 
 
 async def _run_outreach(query, context):
+    try:
+        await _run_outreach_inner(query, context)
+    except Exception as e:
+        error_msg = str(e)[:400]
+        keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
+        await query.edit_message_text(
+            f"❌ *Campaign Error:*\n\n`{error_msg}`\n\n"
+            f"*Check:*\n"
+            f"• SMTP settings are correct\n"
+            f"• Flutterwave key is set\n"
+            f"• Render logs for details",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
+        )
+
+
+async def _run_outreach_inner(query, context):
     await query.edit_message_text("🚀 Fetching customers...")
     success, result, message = await fetch_inactive_customers()
     customers = result.get("inactive", [])
@@ -836,9 +852,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Error: {context.error}")
+    error_msg = str(context.error)[:300]
+    logger.error(f"Error: {context.error}", exc_info=True)
     if update and update.effective_message:
-        await update.effective_message.reply_text("⚠️ An error occurred. Please try again.")
+        await update.effective_message.reply_text(
+            f"⚠️ *Error:*\n`{error_msg}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 
 def main():
