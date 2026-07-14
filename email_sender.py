@@ -111,7 +111,11 @@ The Stannet Team"""
 
 
 def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
-    """Send an email via SMTP."""
+    """Send an email via SMTP with timeout."""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        logger.error("SMTP_USERNAME or SMTP_PASSWORD not set!")
+        return False
+
     try:
         msg = MIMEMultipart("alternative")
         msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
@@ -121,7 +125,7 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> b
         msg.attach(MIMEText(text_body, "plain"))
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
             server.starttls()
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
@@ -129,6 +133,13 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> b
         logger.info(f"✅ Email sent to {to_email}")
         return True
 
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"❌ SMTP Auth failed for {to_email}: {e}")
+        logger.error("Check: SMTP_USERNAME and SMTP_PASSWORD (use App Password, not regular password)")
+        return False
+    except smtplib.SMTPException as e:
+        logger.error(f"❌ SMTP error for {to_email}: {e}")
+        return False
     except Exception as e:
         logger.error(f"❌ Failed to send to {to_email}: {e}")
         return False
@@ -137,10 +148,26 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> b
 async def send_reengagement_campaigns(customers: list, progress_callback=None) -> dict:
     """
     Send appropriate emails based on customer type.
-
-    Each customer dict has a 'type' field: 'no_purchase' or 'renewal'
+    Tests SMTP first and stops early if auth fails.
     """
-    results = {"sent": 0, "failed": 0, "total": len(customers)}
+    results = {"sent": 0, "failed": 0, "total": len(customers), "auth_error": False}
+
+    # Test SMTP connection first
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        logger.info("✅ SMTP connection test passed")
+    except smtplib.SMTPAuthenticationError:
+        logger.error("SMTP Authentication failed! Check SMTP_USERNAME and SMTP_PASSWORD.")
+        results["auth_error"] = True
+        results["failed"] = len(customers)
+        return results
+    except Exception as e:
+        logger.error(f"SMTP connection test failed: {e}")
+        results["auth_error"] = True
+        results["failed"] = len(customers)
+        return results
 
     for i, customer in enumerate(customers):
         email = customer.get("email", "")

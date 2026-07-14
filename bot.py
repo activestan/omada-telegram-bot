@@ -347,16 +347,35 @@ async def _run_outreach(query, context):
     results = await send_reengagement_campaigns(customers, progress_cb)
 
     keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
-    await query.edit_message_text(
-        f"✅ *Campaign Complete!*\n\n"
-        f"📧 *Emails Sent:* {results['sent']}\n"
-        f"  🆕 No-purchase reminders: {len(no_purchase)}\n"
-        f"  🔄 Renewal reminders: {len(renewal)}\n"
-        f"❌ *Failed:* {results['failed']}\n\n"
-        f"⏭️ *Skipped (still active):* {skipped_active}\n\n"
-        f"🕐 _{datetime.now().strftime('%Y-%m-%d %H:%M')}_",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
-    )
+
+    if results.get("auth_error"):
+        await query.edit_message_text(
+            f"❌ *SMTP Authentication Failed!*\n\n"
+            f"Your email credentials are wrong or not set.\n\n"
+            f"*Fix:*\n"
+            f"1. Go to Render → Environment\n"
+            f"2. Check these vars:\n"
+            f"   • `SMTP_USERNAME` = your Gmail\n"
+            f"   • `SMTP_PASSWORD` = Gmail *App Password*\n"
+            f"   (NOT your regular Gmail password!)\n\n"
+            f"*Get App Password:*\n"
+            f"1. Go to myaccount.google.com\n"
+            f"2. Security → 2-Step Verification → ON\n"
+            f"3. App Passwords → create one\n"
+            f"4. Use the 16-char password as SMTP_PASSWORD",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await query.edit_message_text(
+            f"✅ *Campaign Complete!*\n\n"
+            f"📧 *Emails Sent:* {results['sent']}\n"
+            f"  🆕 No-purchase reminders: {len(no_purchase)}\n"
+            f"  🔄 Renewal reminders: {len(renewal)}\n"
+            f"❌ *Failed:* {results['failed']}\n\n"
+            f"⏭️ *Skipped (still active):* {skipped_active}\n\n"
+            f"🕐 _{datetime.now().strftime('%Y-%m-%d %H:%M')}_",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
+        )
 
 
 # ============================================
