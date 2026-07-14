@@ -268,9 +268,9 @@ async def _show_outreach_menu(query):
 
 
 async def _preview_outreach(query):
-    await query.edit_message_text("🔍 Fetching inactive customers...")
+    await query.edit_message_text("🔍 Fetching customers from Flutterwave...")
     success, result, message = await fetch_inactive_customers()
-    customers = result["inactive"]
+    customers = result.get("inactive", [])
 
     if success and customers:
         text = f"👥 *Customer Breakdown:*\n\n"
@@ -284,12 +284,18 @@ async def _preview_outreach(query):
         if len(customers) > 10:
             text += f"_...and {len(customers) - 10} more_\n"
     else:
-        text = f"ℹ️ {message}"
-        if result.get("total"):
-            text += f"\n\n📦 Total: {result['total']} | ⏭️ Active: {len(result['active'])} | ❌ No email: {len(result['no_email'])}"
+        text = f"❌ *Could not fetch customers*\n\n"
+        text += f"Error: `{message}`\n\n"
+        text += f"*Check:*\n"
+        text += f"1. FLUTTERWAVE\_SECRET\_KEY is set correctly\n"
+        text += f"2. Key starts with `FLWSECK-`\n"
+        text += f"3. Key is LIVE secret key (not test)\n"
+        text += f"4. You have customers in Flutterwave dashboard\n"
+        if result.get("total", 0) > 0:
+            text += f"\n📦 Total: {result['total']} | Active: {len(result.get('active', []))} | No email: {len(result.get('no_email', []))}"
 
     keyboard = [
-        [InlineKeyboardButton("▶️ Run Campaign", callback_data="outreach_run")],
+        [InlineKeyboardButton("🔄 Retry", callback_data="outreach_preview")],
         [InlineKeyboardButton("◀️ Back", callback_data="outreach")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
