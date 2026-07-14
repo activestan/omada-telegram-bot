@@ -468,7 +468,8 @@ def main():
         print("❌ TELEGRAM_BOT_TOKEN not set!")
         return
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
