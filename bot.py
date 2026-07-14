@@ -267,16 +267,24 @@ async def _show_outreach_menu(query):
 
 async def _preview_outreach(query):
     await query.edit_message_text("🔍 Fetching inactive customers...")
-    success, customers, message = await fetch_inactive_customers()
+    success, result, message = await fetch_inactive_customers()
+    customers = result["inactive"]
 
     if success and customers:
-        text = f"👥 *{len(customers)} inactive customers:*\n\n"
+        text = f"👥 *Customer Breakdown:*\n\n"
+        text += f"📦 Total customers: *{result['total']}*\n"
+        text += f"📧 To email (inactive): *{len(customers)}*\n"
+        text += f"⏭️ Skipped (active): *{len(result['active'])}*\n"
+        text += f"❌ Skipped (no email): *{len(result['no_email'])}*\n\n"
+        text += f"*First 10 to email:*\n"
         for i, c in enumerate(customers[:10], 1):
             text += f"{i}. {c.get('name', 'N/A')}\n   📧 {c.get('email')}\n\n"
         if len(customers) > 10:
             text += f"_...and {len(customers) - 10} more_\n"
     else:
         text = f"ℹ️ {message}"
+        if result.get("total"):
+            text += f"\n\n📦 Total: {result['total']} | ⏭️ Active: {len(result['active'])} | ❌ No email: {len(result['no_email'])}"
 
     keyboard = [
         [InlineKeyboardButton("▶️ Run Campaign", callback_data="outreach_run")],
@@ -287,20 +295,39 @@ async def _preview_outreach(query):
 
 async def _run_outreach(query, context):
     await query.edit_message_text("🚀 Fetching customers...")
-    success, customers, message = await fetch_inactive_customers()
+    success, result, message = await fetch_inactive_customers()
+    customers = result["inactive"]
+
+    skipped_active = len(result["active"])
+    skipped_no_email = len(result["no_email"])
+    total_customers = result["total"]
 
     if not success or not customers:
-        await query.edit_message_text(f"❌ {message}")
+        text = f"❌ {message}"
+        if total_customers:
+            text += (
+                f"\n\n📦 Total: {total_customers}\n"
+                f"⏭️ Skipped (active subs): {skipped_active}\n"
+                f"❌ Skipped (no email): {skipped_no_email}"
+            )
+        keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    progress_msg = await query.edit_message_text(f"📧 Sending to {len(customers)} customers...")
+    progress_msg = await query.edit_message_text(
+        f"📧 Sending to {len(customers)} customers...\n"
+        f"⏭️ {skipped_active + skipped_no_email} skipped"
+    )
 
     async def progress_cb(sent, total, email, ok):
         if sent % 5 == 0 or sent == total:
             try:
                 await context.bot.edit_message_text(
                     chat_id=query.message.chat_id, message_id=progress_msg.message_id,
-                    text=f"📧 Progress: {sent}/{total}\nLatest: {'✅' if ok else '❌'} {email}"
+                    text=(
+                        f"📧 Progress: {sent}/{total}\n"
+                        f"Latest: {'✅' if ok else '❌'} {email}"
+                    )
                 )
             except:
                 pass
@@ -309,8 +336,14 @@ async def _run_outreach(query, context):
 
     keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
     await query.edit_message_text(
-        f"✅ *Campaign Done!*\n\n"
-        f"✅ Sent: {results['sent']}\n❌ Failed: {results['failed']}\n📦 Total: {results['total']}",
+        f"✅ *Campaign Complete!*\n\n"
+        f"📦 *Total Customers:* {total_customers}\n\n"
+        f"📧 *Emails Sent:* {results['sent']}\n"
+        f"❌ *Failed to Send:* {results['failed']}\n\n"
+        f"⏭️ *Skipped (active subs):* {skipped_active}\n"
+        f"⏭️ *Skipped (no email):* {skipped_no_email}\n"
+        f"⏭️ *Total Skipped:* {skipped_active + skipped_no_email}\n\n"
+        f"🕐 _{datetime.now().strftime('%Y-%m-%d %H:%M')}_",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
     )
 

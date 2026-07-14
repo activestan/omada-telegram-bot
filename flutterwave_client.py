@@ -107,27 +107,25 @@ class FlutterwaveClient:
 
         return []
 
-    async def get_inactive_customers(self) -> list:
+    async def get_inactive_customers(self) -> dict:
         """
         Get customers who are NOT on an active subscription.
         
-        Logic:
-        1. Fetch all customers
-        2. Fetch all active subscriptions/transfers
-        3. Cross-reference to find customers without active subs
-        
-        Returns list of customer dicts with email info.
+        Returns dict with:
+            - inactive: list of customer dicts to email
+            - active: list of active customers (skipped)
+            - no_email: list of customers without email (skipped)
+            - total: total customer count
         """
         customers = await self.get_all_customers()
         if not customers:
-            return []
+            return {"inactive": [], "active": [], "no_email": [], "total": 0}
 
         # Get all transactions to identify active subscribers
         active_customer_ids = set()
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
-                # Fetch recent successful transactions (last 30 days worth)
                 resp = await client.get(
                     f"{FLUTTERWAVE_BASE_URL}/transactions",
                     headers=self.headers,
@@ -152,23 +150,41 @@ class FlutterwaveClient:
             except Exception as e:
                 logger.error(f"Error fetching transactions: {e}")
 
-        # Filter customers not in active list
         inactive = []
+        active = []
+        no_email = []
+
         for customer in customers:
             cust_id = customer.get("id")
             email = customer.get("email", "")
+            info = {
+                "id": cust_id,
+                "name": customer.get("name", ""),
+                "email": email,
+                "phone": customer.get("phone", ""),
+                "created_at": customer.get("created_at", "")
+            }
 
-            if cust_id not in active_customer_ids and email:
-                inactive.append({
-                    "id": cust_id,
-                    "name": customer.get("name", ""),
-                    "email": email,
-                    "phone": customer.get("phone", ""),
-                    "created_at": customer.get("created_at", "")
-                })
+            if cust_id in active_customer_ids:
+                active.append(info)
+            elif not email:
+                no_email.append(info)
+            else:
+                inactive.append(info)
 
-        logger.info(f"Found {len(inactive)} inactive customers out of {len(customers)} total")
-        return inactive
+        logger.info(
+            f"Total: {len(customers)} | "
+            f"Inactive: {len(inactive)} | "
+            f"Active (skipped): {len(active)} | "
+            f"No email (skipped): {len(no_email)}"
+        )
+
+        return {
+            "inactive": inactive,
+            "active": active,
+            "no_email": no_email,
+            "total": len(customers)
+        }
 
 
 def _get_date_30_days_ago() -> str:
@@ -186,17 +202,23 @@ def _get_today() -> str:
 async def fetch_inactive_customers() -> tuple:
     """
     Main function to fetch inactive customers.
-    Returns: (success: bool, customers: list, message: str)
+    Returns: (success: bool, result: dict, message: str)
+    
+    result dict contains:
+        - inactive: list of customers to email
+        - active: list of active customers (skipped)
+        - no_email: list with no email (skipped)
+        - total: total customer count
     """
     try:
         client = FlutterwaveClient()
-        inactive = await client.get_inactive_customers()
+        result = await client.get_inactive_customers()
 
-        if inactive:
-            return True, inactive, f"Found {len(inactive)} inactive customers"
+        if result["inactive"]:
+            return True, result, f"Found {len(result['inactive'])} inactive customers"
         else:
-            return False, [], "No inactive customers found or error fetching data"
+            return False, result, "No inactive customers found or error fetching data"
 
     except Exception as e:
         logger.error(f"Error in fetch_inactive_customers: {e}")
-        return False, [], f"Error: {str(e)}"
+        return False, {"inactive": [], "active": [], "no_email": [], "total": 0}, f"Error: {str(e)}"
