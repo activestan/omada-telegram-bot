@@ -555,11 +555,75 @@ async def _import_codes_from_text(raw_text: str, message):
     errors = []
     lines = raw_text.strip().split('\n')
 
-    # Try to detect if this is a CSV with headers (Omada export format)
+    # Detect Omada Controller CSV export format
+    # Format: "CODE","date",...,"24.0Hours","Voucher Duration","Permanent","Expired",...,"stanNet",...
+    is_omada_export = False
+    is_csv_with_headers = False
     first_line = lines[0].strip().lower() if lines else ""
-    is_csv_with_headers = any(h in first_line for h in ["code", "voucher", "password", "pin", "name", "duration"])
 
-    if is_csv_with_headers:
+    if lines and "hours" in first_line and "voucher duration" in first_line:
+        is_omada_export = True
+    else:
+        is_csv_with_headers = any(h in first_line for h in ["code", "voucher", "password", "pin", "name", "duration"])
+
+    if is_omada_export:
+        import re as _re
+        reader = csv.reader(io.StringIO(raw_text))
+        skipped_expired = 0
+        for i, row in enumerate(reader, 1):
+            if len(row) < 12:
+                continue
+
+            code = row[0].strip().strip('"')
+            if not code or len(code) < 4:
+                continue
+
+            # Skip expired/used vouchers
+            status = row[13].strip().strip('"').lower() if len(row) > 13 else ""
+            if status in ["expired", "used"]:
+                skipped_expired += 1
+                continue
+
+            # Parse duration from "24.0Hours", "72.0Hours", "168.0Hours", "744.0Hours"
+            dur_str = row[11].strip().strip('"').lower() if len(row) > 11 else ""
+            dur_type = None
+
+            hours_match = _re.search(r'([\d.]+)\s*hours?', dur_str)
+            if hours_match:
+                hours = float(hours_match.group(1))
+                if hours <= 24.5:
+                    dur_type = "daily"
+                elif hours <= 72.5:
+                    dur_type = "3days"
+                elif hours <= 168.5:
+                    dur_type = "weekly"
+                else:
+                    dur_type = "monthly"
+
+            if not dur_type:
+                days_match = _re.search(r'([\d.]+)\s*days?', dur_str)
+                if days_match:
+                    days = float(days_match.group(1))
+                    if days <= 1.5:
+                        dur_type = "daily"
+                    elif days <= 3.5:
+                        dur_type = "3days"
+                    elif days <= 7.5:
+                        dur_type = "weekly"
+                    else:
+                        dur_type = "monthly"
+
+            if not dur_type:
+                errors.append(f"Row {i}: Can't parse duration `{dur_str}`")
+                continue
+
+            dur_minutes = valid_durations[dur_type]
+            codes_to_add.append((code, dur_type, dur_minutes, ""))
+
+        if skipped_expired:
+            errors.append(f"Skipped {skipped_expired} expired/used vouchers")
+
+    elif is_csv_with_headers:
         # Parse as CSV with headers
         reader = csv.DictReader(io.StringIO(raw_text))
         for i, row in enumerate(reader, 2):
