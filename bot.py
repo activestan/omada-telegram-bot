@@ -142,6 +142,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_admin(query)
     elif data == "extract_codes":
         await _run_extraction(query.message)
+    elif data == "add_codes":
+        await _show_add_codes(query)
     elif data == "back_to_menu":
         await _back_to_menu(query)
 
@@ -355,23 +357,62 @@ async def _run_outreach(query, context):
 async def _show_admin(query):
     text = (
         "⚙️ *Admin Panel*\n\n"
-        "🔄 *Extract Codes* — Run the extraction\n"
-        "script to pull voucher codes from\n"
-        "your Omada Cloud Controller.\n\n"
-        "This pulls: `whatsapp_1day`, `whatsapp_3days`,\n"
-        "`whatsapp_7days`, `whatsapp_31days`"
+        "📥 *Add Codes* — Paste codes manually\n"
+        "🔄 *Extract* — Pull from Omada (needs local setup)\n\n"
+        "Target vouchers: `whatsapp_1day`,\n"
+        "`whatsapp_3days`, `whatsapp_7days`, `whatsapp_31days`"
     )
     keyboard = [
-        [InlineKeyboardButton("🔄 Extract Codes Now", callback_data="extract_codes")],
+        [InlineKeyboardButton("📥 Add Codes Manually", callback_data="add_codes")],
+        [InlineKeyboardButton("🔄 Extract from Omada", callback_data="extract_codes")],
         [InlineKeyboardButton("📊 View Stats", callback_data="stats")],
         [InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
+async def _show_add_codes(query):
+    text = (
+        "📥 *Add Codes Manually*\n\n"
+        "Send codes in this format (one per line):\n\n"
+        "```\n"
+        "ABC123,daily\n"
+        "DEF456,3days\n"
+        "GHI789,weekly\n"
+        "JKL012,monthly\n"
+        "```\n\n"
+        "*Duration types:*\n"
+        "• `daily` = 1 day\n"
+        "• `3days` = 3 days\n"
+        "• `weekly` = 7 days\n"
+        "• `monthly` = 31 days\n\n"
+        "Or send a `.csv` / `.txt` file with the same format.\n\n"
+        "👇 *Paste your codes below:*"
+    )
+    keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="admin")]]
+
+    # Set user state to "adding codes"
+    context_user_id = query.from_user.id
+    # We'll use a global dict to track state
+    _user_states[context_user_id] = "adding_codes"
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
+
+# Global dict to track user states
+_user_states = {}
+
+
 async def _run_extraction(message):
     """Run the extraction script and report results."""
-    await message.reply_text("🔄 Starting code extraction from Omada Cloud...\n⏳ This may take 30-60 seconds...")
+    await message.reply_text(
+        "🔄 Starting code extraction from Omada Cloud...\n"
+        "⏳ This may take 30-60 seconds...\n\n"
+        "⚠️ *Note:* If this fails on Render, you can:\n"
+        "1. Use *Add Codes Manually* instead\n"
+        "2. Run `python extract_codes.py` on your local computer",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
     try:
         result = subprocess.run(
@@ -434,10 +475,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return
 
+    user_id = update.effective_user.id
+
+    # Check if user is in "adding codes" mode
+    if _user_states.get(user_id) == "adding_codes":
+        await _process_pasted_codes(update)
+        return
+
     text = update.message.text.lower().strip()
     keyword_map = {
         "daily": "daily", "day": "daily", "1day": "daily",
         "3days": "3days", "3 days": "3days", "3day": "3days",
+        "threedays": "3days",
         "weekly": "weekly", "week": "weekly", "7days": "weekly",
         "monthly": "monthly", "month": "monthly", "31days": "monthly",
     }
@@ -453,8 +502,126 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_stats(FakeQuery())
     elif text in ["extract", "sync", "pull"]:
         await _run_extraction(update.message)
+    elif text in ["cancel", "stop", "done"]:
+        _user_states.pop(user_id, None)
+        await update.message.reply_text("✅ Done. Type /start for the menu.")
     else:
         await update.message.reply_text("Type /start for the menu or /help for commands.")
+
+
+async def _process_pasted_codes(update: Update):
+    """Process codes pasted by the user in add-codes mode."""
+    user_id = update.effective_user.id
+    raw_text = update.message.text.strip()
+
+    if raw_text.lower() in ["cancel", "done", "stop", "/cancel", "/done"]:
+        _user_states.pop(user_id, None)
+        keyboard = [[InlineKeyboardButton("◀️ Admin", callback_data="admin")]]
+        await update.message.reply_text("✅ Done adding codes.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    await _import_codes_from_text(raw_text, update.message)
+
+
+async def _import_codes_from_text(raw_text: str, message):
+    """Parse and import codes from text."""
+    import aiosqlite
+    from config import DATABASE_PATH
+
+    lines = raw_text.strip().split('\n')
+    valid_durations = {"daily": 1440, "3days": 4320, "weekly": 10080, "monthly": 43200}
+
+    codes_to_add = []
+    errors = []
+
+    for i, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        if ',' in line:
+            parts = line.split(',')
+        elif '|' in line:
+            parts = line.split('|')
+        elif '\t' in line:
+            parts = line.split('\t')
+        else:
+            errors.append(f"Line {i}: No separator — `{line[:30]}`")
+            continue
+
+        if len(parts) < 2:
+            errors.append(f"Line {i}: Need code,type — `{line[:30]}`")
+            continue
+
+        code = parts[0].strip()
+        dur_type = parts[1].strip().lower()
+
+        if not code:
+            errors.append(f"Line {i}: Empty code")
+            continue
+        if dur_type not in valid_durations:
+            errors.append(f"Line {i}: Bad type `{dur_type}`")
+            continue
+
+        codes_to_add.append((code, dur_type, valid_durations[dur_type], ""))
+
+    inserted = 0
+    if codes_to_add:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            for code, dur_type, dur_min, vid in codes_to_add:
+                try:
+                    cursor = await db.execute(
+                        "INSERT OR IGNORE INTO codes (code, duration_type, duration_minutes, omada_voucher_id) VALUES (?, ?, ?, ?)",
+                        (code, dur_type, dur_min, vid)
+                    )
+                    if cursor.rowcount > 0:
+                        inserted += 1
+                except:
+                    pass
+            await db.commit()
+
+    result = f"📥 *Import Results*\n\n"
+    result += f"📝 Lines read: {len(lines)}\n"
+    result += f"✅ New codes added: {inserted}\n"
+    result += f"♻️ Duplicates skipped: {len(codes_to_add) - inserted}\n"
+    if errors:
+        result += f"⚠️ Errors: {len(errors)}\n"
+
+    if errors[:5]:
+        result += f"\n*Errors:*\n"
+        for err in errors[:5]:
+            result += f"• {err}\n"
+        if len(errors) > 5:
+            result += f"_...and {len(errors) - 5} more_\n"
+
+    if codes_to_add:
+        by_type = {}
+        for _, dt, _, _ in codes_to_add:
+            by_type[dt] = by_type.get(dt, 0) + 1
+        result += f"\n*Breakdown:*\n"
+        for dt, count in sorted(by_type.items()):
+            display = DURATION_DISPLAY.get(dt, dt)
+            result += f"  {display}: {count}\n"
+
+    result += f"\n_Send more codes or type `done` to finish._"
+    await message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle uploaded CSV/TXT files with codes."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    document = update.message.document
+    await update.message.reply_text(f"📁 Processing `{document.file_name}`...", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        file = await context.bot.get_file(document.file_id)
+        file_bytes = await file.download_as_bytearray()
+        raw_text = file_bytes.decode('utf-8')
+        await _import_codes_from_text(raw_text, update.message)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error reading file: {str(e)}")
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -482,6 +649,7 @@ def main():
     app.add_handler(CommandHandler("monthly", monthly_command))
     app.add_handler(CommandHandler("extract", extract_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.Document.TXT | filters.Document.FileExtension("csv"), handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 
