@@ -1,172 +1,169 @@
 """
-Email Sender Module
-Sends re-engagement emails to inactive customers via SMTP.
+Email Sender - Uses your exact email templates.
+
+Two email types:
+1. No-purchase reminder (registered but never bought)
+2. Renewal reminder (bought before, subscription expired)
 """
 import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
 from config import (
     SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
     SMTP_FROM_EMAIL, SMTP_FROM_NAME,
-    WHATSAPP_LINK, TELEGRAM_BOT_LINK
+    TELEGRAM_BOT_LINK
 )
 
 logger = logging.getLogger(__name__)
 
+# Your subscription durations
+SUBSCRIPTION_DURATIONS = {
+    400: 1,
+    1000: 3,
+    2000: 7,
+    7000: 31
+}
 
-def build_reengagement_email(customer_name: str) -> tuple:
-    """
-    Build the re-engagement email HTML and plain text content.
-    
-    Returns: (subject, html_body, text_body)
-    """
-    name = customer_name if customer_name else "Valued Customer"
 
-    subject = f"We Miss You, {name}! 🎉 We're Still Here For You"
+def build_no_purchase_email(name: str, days_since_registration) -> tuple:
+    """Build email for customer who registered but never bought."""
+    subject = f"Hi {name}, your Stannet internet code is waiting"
 
-    html_body = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-            .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                       color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }}
-            .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }}
-            .button {{ display: inline-block; padding: 12px 30px; margin: 10px;
-                      background-color: #25D366; color: white; text-decoration: none;
-                      border-radius: 5px; font-weight: bold; }}
-            .button-telegram {{ background-color: #0088cc; }}
-            .footer {{ text-align: center; padding: 20px; color: #888; font-size: 12px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>👋 Hello {name}!</h1>
-                <p>We've Missed You!</p>
-            </div>
-            <div class="content">
-                <p>Hi {name},</p>
-                
-                <p>We noticed it's been a while since you last used our services, and we wanted 
-                to let you know that <strong>we're still active and ready to serve you!</strong></p>
-                
-                <p>Our team has been working hard to improve your experience, and we'd love 
-                for you to come back and see what's new.</p>
-                
-                <h3>📱 Stay Connected With Us:</h3>
-                
-                <p>
-                    <a href="{WHATSAPP_LINK}" class="button">
-                        💬 Chat on WhatsApp
-                    </a>
-                </p>
-                <p>
-                    <a href="{TELEGRAM_BOT_LINK}" class="button button-telegram">
-                        🤖 Use Our Telegram Bot
-                    </a>
-                </p>
-                
-                <p>Whether you need support, want to place an order, or just want to say hello, 
-                we're just a message away!</p>
-                
-                <p>Looking forward to hearing from you! 🙌</p>
-                
-                <p>Best regards,<br>
-                <strong>{SMTP_FROM_NAME}</strong></p>
-            </div>
-            <div class="footer">
-                <p>This email was sent on {datetime.now().strftime("%B %d, %Y")}.</p>
-                <p>If you no longer wish to receive emails, please reply with "unsubscribe".</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    if days_since_registration is None:
+        reg_text = "You created your Stannet account, but you have not bought an internet code yet."
+    else:
+        reg_text = f"You created your Stannet account {days_since_registration} days ago, but you have not bought an internet code yet."
 
-    text_body = f"""
-Hello {name}!
+    text_body = f"""Hi {name},
 
-We noticed it's been a while since you last used our services, and we wanted 
-to let you know that we're still active and ready to serve you!
+{reg_text}
 
-Our team has been working hard to improve your experience, and we'd love 
-for you to come back and see what's new.
+You can get connected in just a few seconds by buying your internet code through our Telegram bot:
 
-Stay Connected With Us:
-- WhatsApp: {WHATSAPP_LINK}
-- Telegram Bot: {TELEGRAM_BOT_LINK}
+👉 {TELEGRAM_BOT_LINK}
 
-Whether you need support, want to place an order, or just want to say hello, 
-we're just a message away!
+If you need help choosing a package or completing your purchase, we are ready to assist you.
 
-Looking forward to hearing from you!
+We look forward to having you online.
 
 Best regards,
-{SMTP_FROM_NAME}
+The Stannet Team"""
+
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <p>Hi {name},</p>
+        <p>{reg_text}</p>
+        <p>You can get connected in just a few seconds by buying your internet code through our Telegram bot:</p>
+        <p style="text-align: center; margin: 30px 0;">
+            <a href="{TELEGRAM_BOT_LINK}" style="display: inline-block; padding: 14px 35px; background-color: #0088cc; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 16px;">
+                🤖 Get Your Code Now
+            </a>
+        </p>
+        <p>If you need help choosing a package or completing your purchase, we are ready to assist you.</p>
+        <p>We look forward to having you online.</p>
+        <p>Best regards,<br><strong>The Stannet Team</strong></p>
+    </div>
     """
 
     return subject, html_body.strip(), text_body.strip()
 
 
-def send_email(to_email: str, to_name: str, subject: str, html_body: str, text_body: str) -> bool:
+def build_renewal_email(name: str, days_since: int, amount: int, threshold: int) -> tuple:
+    """Build email for customer who bought before but hasn't renewed."""
+    duration = SUBSCRIPTION_DURATIONS.get(threshold, 0)
+    days_to_show = max(0, days_since - duration)
+
+    subject = f"We miss you, {name}! Ready to reconnect with Stannet?"
+
+    text_body = f"""Hi {name},
+
+We noticed it's been {days_to_show} days since your last subscription of ₦{amount} for your Stannet internet service.
+
+We truly miss having you connected with us and can't wait to get you back online!
+
+Your fast and reliable internet is just a quick top-up away. If you need any help or want to renew your subscription, simply reach out to our Telegram bot:
+
+👉 {TELEGRAM_BOT_LINK}
+
+We're here whenever you're ready.
+
+Best regards,
+The Stannet Team"""
+
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <p>Hi {name},</p>
+        <p>We noticed it's been <strong>{days_to_show} days</strong> since your last subscription of <strong>₦{amount}</strong> for your Stannet internet service.</p>
+        <p>We truly miss having you connected with us and can't wait to get you back online!</p>
+        <p>Your fast and reliable internet is just a quick top-up away. If you need any help or want to renew your subscription, simply reach out to our Telegram bot:</p>
+        <p style="text-align: center; margin: 30px 0;">
+            <a href="{TELEGRAM_BOT_LINK}" style="display: inline-block; padding: 14px 35px; background-color: #0088cc; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 16px;">
+                🤖 Renew Your Subscription
+            </a>
+        </p>
+        <p>We're here whenever you're ready.</p>
+        <p>Best regards,<br><strong>The Stannet Team</strong></p>
+    </div>
     """
-    Send an email via SMTP.
-    
-    Returns True if sent successfully, False otherwise.
-    """
+
+    return subject, html_body.strip(), text_body.strip()
+
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+    """Send an email via SMTP."""
     try:
         msg = MIMEMultipart("alternative")
         msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
         msg["To"] = to_email
         msg["Subject"] = subject
 
-        # Attach plain text and HTML versions
-        part1 = MIMEText(text_body, "plain")
-        part2 = MIMEText(html_body, "html")
-        msg.attach(part1)
-        msg.attach(part2)
+        msg.attach(MIMEText(text_body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
 
-        logger.info(f"Email sent to {to_email}")
+        logger.info(f"✅ Email sent to {to_email}")
         return True
 
     except Exception as e:
-        logger.error(f"Failed to send email to {to_email}: {e}")
+        logger.error(f"❌ Failed to send to {to_email}: {e}")
         return False
 
 
 async def send_reengagement_campaigns(customers: list, progress_callback=None) -> dict:
     """
-    Send re-engagement emails to a list of inactive customers.
-    
-    Args:
-        customers: List of customer dicts with 'email' and 'name' keys
-        progress_callback: Optional async function(sent, total, email, success) for progress updates
-    
-    Returns:
-        Dict with 'sent', 'failed', 'total' counts
+    Send appropriate emails based on customer type.
+
+    Each customer dict has a 'type' field: 'no_purchase' or 'renewal'
     """
     results = {"sent": 0, "failed": 0, "total": len(customers)}
 
     for i, customer in enumerate(customers):
         email = customer.get("email", "")
-        name = customer.get("name", "")
+        name = customer.get("name", "Valued Customer")
+        cust_type = customer.get("type", "renewal")
 
         if not email:
             results["failed"] += 1
             continue
 
-        subject, html_body, text_body = build_reengagement_email(name)
-        success = send_email(email, name, subject, html_body, text_body)
+        if cust_type == "no_purchase":
+            subject, html, text = build_no_purchase_email(
+                name, customer.get("days_since")
+            )
+        else:
+            subject, html, text = build_renewal_email(
+                name,
+                customer.get("days_since", 0),
+                customer.get("amount", 0),
+                customer.get("threshold", 400)
+            )
+
+        success = send_email(email, subject, html, text)
 
         if success:
             results["sent"] += 1

@@ -271,6 +271,8 @@ async def _preview_outreach(query):
     await query.edit_message_text("🔍 Fetching customers from Flutterwave...")
     success, result, message = await fetch_inactive_customers()
     customers = result.get("inactive", [])
+    no_purchase = result.get("no_purchase", [])
+    renewal = result.get("renewal", [])
 
     if success and customers:
         text = f"👥 *Customer Breakdown:*\n\n"
@@ -304,11 +306,13 @@ async def _preview_outreach(query):
 async def _run_outreach(query, context):
     await query.edit_message_text("🚀 Fetching customers...")
     success, result, message = await fetch_inactive_customers()
-    customers = result["inactive"]
+    customers = result.get("inactive", [])
+    no_purchase = result.get("no_purchase", [])
+    renewal = result.get("renewal", [])
 
-    skipped_active = len(result["active"])
-    skipped_no_email = len(result["no_email"])
-    total_customers = result["total"]
+    skipped_active = len(result.get("active", []))
+    skipped_no_email = len(result.get("no_email", []))
+    total_customers = result.get("total", 0)
 
     if not success or not customers:
         text = f"❌ {message}"
@@ -345,12 +349,11 @@ async def _run_outreach(query, context):
     keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
     await query.edit_message_text(
         f"✅ *Campaign Complete!*\n\n"
-        f"📦 *Total Customers:* {total_customers}\n\n"
         f"📧 *Emails Sent:* {results['sent']}\n"
-        f"❌ *Failed to Send:* {results['failed']}\n\n"
-        f"⏭️ *Skipped (active subs):* {skipped_active}\n"
-        f"⏭️ *Skipped (no email):* {skipped_no_email}\n"
-        f"⏭️ *Total Skipped:* {skipped_active + skipped_no_email}\n\n"
+        f"  🆕 No-purchase reminders: {len(no_purchase)}\n"
+        f"  🔄 Renewal reminders: {len(renewal)}\n"
+        f"❌ *Failed:* {results['failed']}\n\n"
+        f"⏭️ *Skipped (still active):* {skipped_active}\n\n"
         f"🕐 _{datetime.now().strftime('%Y-%m-%d %H:%M')}_",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
     )
