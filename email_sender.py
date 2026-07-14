@@ -1,23 +1,23 @@
 """
-Email Sender - Uses your exact email templates.
+Email Sender - Supports Resend API (works on Render free tier) and SMTP fallback.
 
-Two email types:
-1. No-purchase reminder (registered but never bought)
-2. Renewal reminder (bought before, subscription expired)
+Resend: Free 3000 emails/month, uses HTTPS (port 443) — works everywhere.
+SMTP: Traditional, but blocked on some free hosting platforms.
 """
 import smtplib
 import logging
+import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from config import (
     SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
     SMTP_FROM_EMAIL, SMTP_FROM_NAME,
+    EMAIL_PROVIDER, RESEND_API_KEY,
     TELEGRAM_BOT_LINK
 )
 
 logger = logging.getLogger(__name__)
 
-# Your subscription durations
 SUBSCRIPTION_DURATIONS = {
     400: 1,
     1000: 3,
@@ -78,7 +78,7 @@ def build_renewal_email(name: str, days_since: int, amount: int, threshold: int)
 
     text_body = f"""Hi {name},
 
-We noticed it's been {days_to_show} days since your last subscription of ₦{amount} for your Stannet internet service.
+We noticed it's been {days_to_show} days since your last subscription of {amount} for your Stannet internet service.
 
 We truly miss having you connected with us and can't wait to get you back online!
 
@@ -94,7 +94,7 @@ The Stannet Team"""
     html_body = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <p>Hi {name},</p>
-        <p>We noticed it's been <strong>{days_to_show} days</strong> since your last subscription of <strong>₦{amount}</strong> for your Stannet internet service.</p>
+        <p>We noticed it's been <strong>{days_to_show} days</strong> since your last subscription of <strong>{amount}</strong> for your Stannet internet service.</p>
         <p>We truly miss having you connected with us and can't wait to get you back online!</p>
         <p>Your fast and reliable internet is just a quick top-up away. If you need any help or want to renew your subscription, simply reach out to our Telegram bot:</p>
         <p style="text-align: center; margin: 30px 0;">
@@ -110,8 +110,46 @@ The Stannet Team"""
     return subject, html_body.strip(), text_body.strip()
 
 
-def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
-    """Send an email via SMTP with timeout."""
+def send_email_resend(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+    """Send email via Resend API (works on Render free tier)."""
+    if not RESEND_API_KEY:
+        logger.error("RESEND_API_KEY not set!")
+        return False
+
+    try:
+        from_email = SMTP_FROM_EMAIL or "onboarding@resend.dev"
+        from_name = SMTP_FROM_NAME or "Stannet"
+
+        resp = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "from": f"{from_name} <{from_email}>",
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+                "text": text_body
+            },
+            timeout=15.0
+        )
+
+        if resp.status_code in [200, 201]:
+            logger.info(f"✅ Email sent to {to_email} via Resend")
+            return True
+        else:
+            logger.error(f"❌ Resend API error for {to_email}: {resp.status_code} - {resp.text}")
+            return False
+
+    except Exception as e:
+        logger.error(f"❌ Resend failed for {to_email}: {e}")
+        return False
+
+
+def send_email_smtp(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+    """Send email via SMTP (may not work on some free hosting)."""
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         logger.error("SMTP_USERNAME or SMTP_PASSWORD not set!")
         return False
@@ -130,42 +168,66 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> b
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
 
-        logger.info(f"✅ Email sent to {to_email}")
+        logger.info(f"✅ Email sent to {to_email} via SMTP")
         return True
 
     except smtplib.SMTPAuthenticationError as e:
-        logger.error(f"❌ SMTP Auth failed for {to_email}: {e}")
-        logger.error("Check: SMTP_USERNAME and SMTP_PASSWORD (use App Password, not regular password)")
-        return False
-    except smtplib.SMTPException as e:
-        logger.error(f"❌ SMTP error for {to_email}: {e}")
+        logger.error(f"❌ SMTP Auth failed: {e}")
         return False
     except Exception as e:
-        logger.error(f"❌ Failed to send to {to_email}: {e}")
+        logger.error(f"❌ SMTP failed for {to_email}: {e}")
         return False
+
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+    """Send email using the configured provider."""
+    if EMAIL_PROVIDER == "resend":
+        return send_email_resend(to_email, subject, html_body, text_body)
+    else:
+        return send_email_smtp(to_email, subject, html_body, text_body)
+
+
+async def test_email_connection() -> tuple:
+    """Test email connection. Returns (success: bool, message: str)."""
+    if EMAIL_PROVIDER == "resend":
+        if not RESEND_API_KEY:
+            return False, "RESEND_API_KEY not set. Add it in Render Environment."
+        try:
+            resp = httpx.get(
+                "https://api.resend.com/domains",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                timeout=10.0
+            )
+            if resp.status_code == 200:
+                return True, "Resend API connection OK"
+            else:
+                return False, f"Resend API error: {resp.status_code}"
+        except Exception as e:
+            return False, f"Resend connection failed: {e}"
+    else:
+        if not SMTP_USERNAME or not SMTP_PASSWORD:
+            return False, "SMTP_USERNAME or SMTP_PASSWORD not set"
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.starttls()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            return True, "SMTP connection OK"
+        except smtplib.SMTPAuthenticationError:
+            return False, "SMTP auth failed. Check SMTP_PASSWORD (use App Password)"
+        except Exception as e:
+            return False, f"SMTP failed: {e}"
 
 
 async def send_reengagement_campaigns(customers: list, progress_callback=None) -> dict:
-    """
-    Send appropriate emails based on customer type.
-    Tests SMTP first and stops early if auth fails.
-    """
+    """Send appropriate emails based on customer type."""
     results = {"sent": 0, "failed": 0, "total": len(customers), "auth_error": False}
 
-    # Test SMTP connection first
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        logger.info("✅ SMTP connection test passed")
-    except smtplib.SMTPAuthenticationError:
-        logger.error("SMTP Authentication failed! Check SMTP_USERNAME and SMTP_PASSWORD.")
+    # Test connection first
+    ok, msg = await test_email_connection()
+    if not ok:
+        logger.error(f"Email connection test failed: {msg}")
         results["auth_error"] = True
-        results["failed"] = len(customers)
-        return results
-    except Exception as e:
-        logger.error(f"SMTP connection test failed: {e}")
-        results["auth_error"] = True
+        results["error_message"] = msg
         results["failed"] = len(customers)
         return results
 

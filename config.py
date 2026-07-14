@@ -29,6 +29,10 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL")
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Your Business")
 
+# Email provider: 'smtp' or 'resend'
+EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "resend")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+
 # Re-engagement Links
 WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")
 TELEGRAM_BOT_LINK = os.getenv("TELEGRAM_BOT_LINK", "")

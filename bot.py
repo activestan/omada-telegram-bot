@@ -365,21 +365,18 @@ async def _run_outreach_inner(query, context):
     keyboard = [[InlineKeyboardButton("◀️ Menu", callback_data="back_to_menu")]]
 
     if results.get("auth_error"):
+        error_msg = results.get("error_message", "Unknown error")
         await query.edit_message_text(
-            f"❌ *SMTP Authentication Failed!*\n\n"
-            f"Your email credentials are wrong or not set.\n\n"
-            f"*Fix:*\n"
-            f"1. Go to Render → Environment\n"
-            f"2. Check these vars:\n"
-            f"   • `SMTP_USERNAME` = your Gmail\n"
-            f"   • `SMTP_PASSWORD` = Gmail *App Password*\n"
-            f"   (NOT your regular Gmail password!)\n\n"
-            f"*Get App Password:*\n"
-            f"1. Go to myaccount.google.com\n"
-            f"2. Security → 2-Step Verification → ON\n"
-            f"3. App Passwords → create one\n"
-            f"4. Use the 16-char password as SMTP_PASSWORD",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN
+            f"❌ Email Connection Failed!\n\n"
+            f"Error: {error_msg}\n\n"
+            f"Render free tier blocks SMTP (port 587).\n"
+            f"Use Resend (free, works on Render):\n\n"
+            f"1. Sign up at resend.com\n"
+            f"2. Get API Key\n"
+            f"3. Add to Render Environment:\n"
+            f"   RESEND_API_KEY = re_xxxxx\n"
+            f"   EMAIL_PROVIDER = resend",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
         await query.edit_message_text(
